@@ -4,7 +4,7 @@
   <Choose>
     <When Condition="'$(Configuration)' == 'debug'">
       <PropertyGroup>
-        <TargetFrameworks>net8.0-windows</TargetFrameworks>
+        <TargetFrameworks>net8.0-windows;net48</TargetFrameworks>
       </PropertyGroup>
     </When>
     <Otherwise>
