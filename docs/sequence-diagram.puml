@@ -1,0 +1,235 @@
+@startuml FFME_Sequence_Diagram
+
+title メディア再生シーケンス図
+
+actor User as user
+participant "MediaElement\n(WPF UI)" as ui
+participant "MediaEngine\n(Core)" as engine
+participant "CommandManager" as cmd
+participant "MediaContainer" as container
+participant "PacketReadingWorker" as reader
+participant "FrameDecodingWorker" as decoder
+participant "BlockRenderingWorker" as renderer
+participant "MediaComponent\n(Video/Audio)" as component
+participant "Renderer\n(Video/Audio)" as render
+
+== 初期化フェーズ ==
+
+user -> ui: Source = "video.mp4"
+activate ui
+
+ui -> engine: Open(source)
+activate engine
+
+engine -> container: Initialize()
+activate container
+container -> container: StreamInitialize()
+container -> container: Open Input Context
+container --> engine: Initialized
+deactivate container
+
+engine -> container: Open()
+activate container
+container -> container: StreamOpen()
+container -> container: Create Components\n(Video/Audio/Subtitle)
+container --> engine: Components Ready
+deactivate container
+
+engine -> reader: Start()
+activate reader
+engine -> decoder: Start()
+activate decoder
+engine -> renderer: Start()
+activate renderer
+
+engine --> ui: Media Opened
+deactivate engine
+ui --> user: Ready to Play
+deactivate ui
+
+== パケット読み取りフェーズ ==
+
+loop パケット読み取りループ
+  reader -> container: Read()
+  activate container
+  container -> container: StreamRead()
+  container -> component: SendPacket(packet)
+  activate component
+  component -> component: Packets.Push(packet)
+  component --> container: Packet Queued
+  deactivate component
+  container --> reader: MediaType
+  deactivate container
+  
+  note right of reader
+    パケットバッファが
+    十分になるまで継続
+  end note
+end
+
+== フレームデコードフェーズ ==
+
+loop フレームデコードループ
+  decoder -> component: ReceiveNextFrame()
+  activate component
+  
+  component -> component: FeedPacketsToDecoder()
+  component -> component: avcodec_send_packet()
+  component -> component: avcodec_receive_frame()
+  component -> component: CreateFrameSource()
+  
+  component --> decoder: MediaFrame
+  deactivate component
+  
+  decoder -> container: Convert(frame, block)
+  activate container
+  container -> component: MaterializeFrame()
+  activate component
+  component -> component: Scale/Convert Frame
+  component -> component: Create MediaBlock
+  component --> container: MediaBlock
+  deactivate component
+  container --> decoder: Block Ready
+  deactivate container
+  
+  decoder -> decoder: Add Block to Buffer
+  
+  note right of decoder
+    デコードされたブロックを
+    バッファに追加
+  end note
+end
+
+== レンダリングフェーズ ==
+
+user -> ui: Play()
+activate ui
+ui -> engine: Play Command
+activate engine
+engine -> cmd: ProcessPlayCommand()
+activate cmd
+cmd -> engine: Resume Timing
+engine -> renderer: Signal Play
+cmd --> engine: Command Executed
+deactivate cmd
+engine --> ui: Playing
+deactivate engine
+deactivate ui
+
+loop レンダリングループ
+  renderer -> renderer: AlignClocksToPlayback()
+  
+  alt Sync Buffering Needed
+    renderer -> renderer: EnterSyncBuffering()
+    renderer -> engine: Pause RTC
+    note right of renderer
+      コンポーネント間の
+      同期を待つ
+    end note
+    renderer -> renderer: ExitSyncBuffering()
+  end
+  
+  renderer -> renderer: RenderBlock(Video)
+  activate renderer
+  
+  renderer -> engine: Get Current Block
+  engine --> renderer: VideoBlock
+  
+  renderer -> render: Render(block)
+  activate render
+  render -> render: Display Frame
+  render --> renderer: Rendered
+  deactivate render
+  
+  deactivate renderer
+  
+  renderer -> renderer: RenderBlock(Audio)
+  activate renderer
+  
+  renderer -> engine: Get Current Block
+  engine --> renderer: AudioBlock
+  
+  renderer -> render: Render(block)
+  activate render
+  render -> render: Play Audio Samples
+  render --> renderer: Rendered
+  deactivate render
+  
+  deactivate renderer
+  
+  renderer -> renderer: Update Playback Position
+  renderer -> ui: Position Changed Event
+  
+  note right of renderer
+    タイミングコントローラーに
+    基づいて継続的にレンダリング
+  end note
+end
+
+== シークフェーズ ==
+
+user -> ui: Position = TimeSpan
+activate ui
+ui -> engine: Seek(position)
+activate engine
+
+engine -> cmd: ProcessSeekCommand()
+activate cmd
+
+cmd -> container: Seek(position)
+activate container
+container -> container: StreamSeek()
+container -> component: ClearQueuedPackets()
+activate component
+component -> component: Flush Codec Buffers
+component --> container: Cleared
+deactivate component
+container --> cmd: Seek Frame
+deactivate container
+
+cmd -> reader: Resume Reading
+cmd -> decoder: Resume Decoding
+
+cmd --> engine: Seek Completed
+deactivate cmd
+
+engine --> ui: Position Updated
+deactivate engine
+deactivate ui
+
+note right of renderer
+  レンダリングワーカーは
+  新しいシークブロックを待つ
+end note
+
+== 終了フェーズ ==
+
+user -> ui: Close()
+activate ui
+ui -> engine: Close()
+activate engine
+
+engine -> renderer: Stop()
+deactivate renderer
+engine -> decoder: Stop()
+deactivate decoder
+engine -> reader: Stop()
+deactivate reader
+
+engine -> container: Dispose()
+activate container
+container -> component: Dispose()
+activate component
+component -> component: Close Codec Context
+component --> container: Disposed
+deactivate component
+container -> container: Close Input Context
+container --> engine: Disposed
+deactivate container
+
+engine --> ui: Closed
+deactivate engine
+ui --> user: Media Closed
+deactivate ui
+
+@enduml

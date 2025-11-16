@@ -1,0 +1,319 @@
+@startuml FFME_Detailed_Sequence
+
+title 詳細メディア処理シーケンス図
+
+participant "MediaElement" as ui
+participant "MediaEngine" as engine
+participant "MediaContainer" as container
+participant "VideoComponent" as video
+participant "AudioComponent" as audio
+participant "PacketQueue" as queue
+participant "MediaBlockBuffer" as buffer
+participant "VideoRenderer" as vrender
+participant "AudioRenderer" as arender
+
+== メディアオープン ==
+
+ui -> engine: Open("video.mp4")
+activate engine
+
+engine -> container: new MediaContainer(source)
+activate container
+container -> container: Initialize FFmpeg
+container --> engine: Container Created
+deactivate container
+
+engine -> container: Initialize()
+activate container
+
+container -> container: avformat_open_input()
+note right: FFmpeg入力コンテキストを開く
+
+container -> container: avformat_find_stream_info()
+note right: ストリーム情報を取得
+
+container -> container: Create MediaInfo
+container --> engine: MediaInfo
+deactivate container
+
+engine -> container: Open()
+activate container
+
+container -> video: new VideoComponent(streamIndex)
+activate video
+video -> video: avcodec_alloc_context3()
+video -> video: avcodec_open2()
+video --> container: Video Component Ready
+deactivate video
+
+container -> audio: new AudioComponent(streamIndex)
+activate audio
+audio -> audio: avcodec_alloc_context3()
+audio -> audio: avcodec_open2()
+audio --> container: Audio Component Ready
+deactivate audio
+
+container --> engine: Components Opened
+deactivate container
+
+engine --> ui: Media Opened
+deactivate engine
+
+== パケット読み取りとデコード ==
+
+loop Continuous Reading
+  
+  engine -> container: Read()
+  activate container
+  
+  container -> container: av_read_frame()
+  note right: FFmpegからパケットを読み取る
+  
+  alt Video Packet
+    container -> video: SendPacket(packet)
+    activate video
+    video -> queue: Push(packet)
+    activate queue
+    queue --> video: Queued
+    deactivate queue
+    video --> container: Video Packet Queued
+    deactivate video
+    
+  else Audio Packet
+    container -> audio: SendPacket(packet)
+    activate audio
+    audio -> queue: Push(packet)
+    activate queue
+    queue --> audio: Queued
+    deactivate queue
+    audio --> container: Audio Packet Queued
+    deactivate audio
+  end
+  
+  container --> engine: MediaType
+  deactivate container
+  
+end
+
+loop Continuous Decoding
+  
+  engine -> video: ReceiveNextFrame()
+  activate video
+  
+  video -> queue: Dequeue()
+  activate queue
+  queue --> video: Packet
+  deactivate queue
+  
+  video -> video: avcodec_send_packet()
+  video -> video: avcodec_receive_frame()
+  
+  video -> video: CreateFrameSource()
+  note right: VideoFrameを作成
+  
+  video --> engine: VideoFrame
+  deactivate video
+  
+  engine -> container: Convert(frame, block)
+  activate container
+  
+  container -> video: MaterializeFrame()
+  activate video
+  
+  video -> video: sws_scale()
+  note right: ピクセルフォーマット変換\n(YUV → BGRA)
+  
+  video -> video: Create VideoBlock
+  video -> video: Copy to Buffer
+  
+  video --> container: VideoBlock
+  deactivate video
+  
+  container --> engine: Block Ready
+  deactivate container
+  
+  engine -> buffer: Add(VideoBlock)
+  activate buffer
+  buffer --> engine: Block Added
+  deactivate buffer
+  
+  ' Audio Decoding
+  engine -> audio: ReceiveNextFrame()
+  activate audio
+  
+  audio -> queue: Dequeue()
+  activate queue
+  queue --> audio: Packet
+  deactivate queue
+  
+  audio -> audio: avcodec_send_packet()
+  audio -> audio: avcodec_receive_frame()
+  audio -> audio: CreateFrameSource()
+  
+  audio --> engine: AudioFrame
+  deactivate audio
+  
+  engine -> container: Convert(frame, block)
+  activate container
+  
+  container -> audio: MaterializeFrame()
+  activate audio
+  
+  audio -> audio: swr_convert()
+  note right: サンプルフォーマット変換\n(Planar → Interleaved)
+  
+  audio -> audio: Create AudioBlock
+  audio -> audio: Copy to Buffer
+  
+  audio --> container: AudioBlock
+  deactivate audio
+  
+  container --> engine: Block Ready
+  deactivate container
+  
+  engine -> buffer: Add(AudioBlock)
+  activate buffer
+  buffer --> engine: Block Added
+  deactivate buffer
+  
+end
+
+== レンダリング ==
+
+loop Rendering Loop (15ms interval)
+  
+  engine -> engine: Get Playback Position
+  
+  engine -> buffer: Get VideoBlock at Position
+  activate buffer
+  buffer --> engine: VideoBlock
+  deactivate buffer
+  
+  engine -> vrender: Render(VideoBlock)
+  activate vrender
+  
+  vrender -> vrender: Update BitmapSource
+  note right: WPFビットマップに\nピクセルデータをコピー
+  
+  vrender -> vrender: Invalidate Visual
+  vrender --> engine: Frame Rendered
+  deactivate vrender
+  
+  engine -> buffer: Get AudioBlock at Position
+  activate buffer
+  buffer --> engine: AudioBlock
+  deactivate buffer
+  
+  engine -> arender: Render(AudioBlock)
+  activate arender
+  
+  arender -> arender: Write to Audio Device
+  note right: DirectSound/MMEに\nサンプルを送信
+  
+  arender --> engine: Audio Rendered
+  deactivate arender
+  
+  engine -> engine: Update Timing Controller
+  engine -> ui: Position Changed Event
+  
+end
+
+== シーク処理 ==
+
+ui -> engine: Seek(TimeSpan)
+activate engine
+
+engine -> engine: Pause Playback
+engine -> buffer: Clear All Blocks
+activate buffer
+buffer --> engine: Cleared
+deactivate buffer
+
+engine -> container: Seek(position)
+activate container
+
+container -> container: av_seek_frame()
+note right: FFmpegシーク実行
+
+container -> video: ClearQueuedPackets(flush=true)
+activate video
+video -> queue: Clear()
+activate queue
+queue --> video: Cleared
+deactivate queue
+video -> video: avcodec_flush_buffers()
+video --> container: Flushed
+deactivate video
+
+container -> audio: ClearQueuedPackets(flush=true)
+activate audio
+audio -> queue: Clear()
+activate queue
+queue --> audio: Cleared
+deactivate queue
+audio -> audio: avcodec_flush_buffers()
+audio --> container: Flushed
+deactivate audio
+
+container -> container: Read Seek Packets
+container --> engine: Seek Frame
+deactivate container
+
+engine -> engine: Resume Reading & Decoding
+engine -> engine: Wait for Seek Blocks
+
+loop Until Blocks Available
+  engine -> buffer: IsInRange(position)?
+  activate buffer
+  buffer --> engine: bool
+  deactivate buffer
+end
+
+engine -> engine: Resume Playback
+engine --> ui: Seek Completed
+deactivate engine
+
+== クローズ処理 ==
+
+ui -> engine: Close()
+activate engine
+
+engine -> engine: Stop All Workers
+
+engine -> buffer: Dispose All Blocks
+activate buffer
+buffer -> buffer: Free Unmanaged Memory
+buffer --> engine: Disposed
+deactivate buffer
+
+engine -> container: Dispose()
+activate container
+
+container -> video: Dispose()
+activate video
+video -> video: avcodec_free_context()
+video -> queue: Dispose()
+activate queue
+queue --> video: Disposed
+deactivate queue
+video --> container: Disposed
+deactivate video
+
+container -> audio: Dispose()
+activate audio
+audio -> audio: avcodec_free_context()
+audio -> queue: Dispose()
+activate queue
+queue --> audio: Disposed
+deactivate queue
+audio --> container: Disposed
+deactivate audio
+
+container -> container: avformat_close_input()
+container --> engine: Disposed
+deactivate container
+
+engine --> ui: Closed
+deactivate engine
+
+@enduml

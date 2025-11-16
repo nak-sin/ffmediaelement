@@ -1,0 +1,203 @@
+@startuml FFME_Class_Diagram
+
+!define CORE_COLOR #E8F5E9
+!define CONTAINER_COLOR #E3F2FD
+!define COMPONENT_COLOR #FFF3E0
+!define FRAME_COLOR #FCE4EC
+!define BLOCK_COLOR #F3E5F5
+
+skinparam classAttributeIconSize 0
+skinparam backgroundColor white
+
+package "Core Library" CORE_COLOR {
+  class Library <<static>> {
+    + {static} FFmpegDirectory : string
+    + {static} FFmpegVersionInfo : string
+    + {static} IsInitialized : bool
+    + {static} LoadFFmpeg() : bool
+    + {static} RetrieveMediaInfo() : MediaInfo
+  }
+}
+
+package "WPF UI Layer" {
+  class MediaElement {
+    - MediaCore : MediaEngine
+    - VideoView : ImageHost
+    + Source : Uri
+    + Position : TimeSpan
+    + Volume : double
+    + CaptureBitmapAsync() : Task<Bitmap>
+  }
+}
+
+package "Engine Core" CORE_COLOR {
+  class MediaEngine {
+    - Container : MediaContainer
+    + State : MediaEngineState
+    + Timing : TimingController
+    + MediaInfo : MediaInfo
+    + Dispose() : void
+  }
+
+  class MediaEngineState {
+    + Position : TimeSpan
+    + Volume : double
+    + IsPlaying : bool
+    + HasVideo : bool
+    + HasAudio : bool
+  }
+
+  interface IMediaEngineState {
+    + Position : TimeSpan
+    + MediaState : MediaPlaybackState
+  }
+
+  class TimingController {
+    + Position : TimeSpan
+    + Update() : void
+  }
+}
+
+package "Container Layer" CONTAINER_COLOR {
+  class MediaContainer {
+    - InputContext : AVFormatContext*
+    + Components : MediaComponentSet
+    + MediaInfo : MediaInfo
+    + Initialize() : void
+    + Open() : void
+    + Read() : MediaType
+    + Decode() : IList<MediaFrame>
+    + Seek() : MediaFrame
+  }
+
+  class MediaComponentSet {
+    + Video : VideoComponent
+    + Audio : AudioComponent
+    + Subtitles : SubtitleComponent
+    + Count : int
+  }
+
+  class MediaInfo {
+    + Streams : StreamInfo[]
+    + Duration : TimeSpan
+    + BitRate : long
+  }
+
+  class MediaOptions {
+    + VideoStream : StreamInfo
+    + AudioStream : StreamInfo
+    + IsVideoDisabled : bool
+  }
+}
+
+package "Component Layer" COMPONENT_COLOR {
+  abstract class MediaComponent {
+    # CodecContext : AVCodecContext*
+    + MediaType : MediaType
+    + StreamIndex : int
+    + BufferCount : int
+    + SendPacket() : void
+    + ReceiveNextFrame() : MediaFrame
+    + {abstract} MaterializeFrame() : bool
+  }
+
+  class VideoComponent {
+    + PixelWidth : int
+    + PixelHeight : int
+    + MaterializeFrame() : bool
+  }
+
+  class AudioComponent {
+    + SampleRate : int
+    + Channels : int
+    + MaterializeFrame() : bool
+  }
+
+  class SubtitleComponent {
+    + MaterializeFrame() : bool
+  }
+}
+
+package "Frame Layer" FRAME_COLOR {
+  abstract class MediaFrame {
+    + MediaType : MediaType
+    + StartTime : TimeSpan
+    + Duration : TimeSpan
+    + IsStale : bool
+    + {abstract} Dispose() : void
+  }
+
+  class VideoFrame {
+    + Pointer : AVFrame*
+    + PictureType : AVPictureType
+  }
+
+  class AudioFrame {
+    + Pointer : AVFrame*
+    + SampleRate : int
+  }
+
+  class SubtitleFrame {
+    + Pointer : AVSubtitle*
+  }
+}
+
+package "Block Layer" BLOCK_COLOR {
+  abstract class MediaBlock {
+    + MediaType : MediaType
+    + StartTime : TimeSpan
+    + Duration : TimeSpan
+    + Buffer : IntPtr
+    + BufferLength : int
+    + Dispose() : void
+  }
+
+  class VideoBlock {
+    + PixelWidth : int
+    + PixelHeight : int
+    + PictureBufferStride : int
+  }
+
+  class AudioBlock {
+    + SampleRate : int
+    + ChannelCount : int
+    + SamplesPerChannel : int
+  }
+
+  class SubtitleBlock {
+    + Text : string
+  }
+}
+
+' Relationships
+MediaElement *-- MediaEngine
+MediaEngine *-- MediaEngineState
+MediaEngine *-- MediaContainer
+MediaEngine *-- TimingController
+MediaEngineState ..|> IMediaEngineState
+
+MediaContainer *-- MediaComponentSet
+MediaContainer *-- MediaInfo
+MediaContainer *-- MediaOptions
+
+MediaComponentSet o-- VideoComponent
+MediaComponentSet o-- AudioComponent
+MediaComponentSet o-- SubtitleComponent
+
+VideoComponent --|> MediaComponent
+AudioComponent --|> MediaComponent
+SubtitleComponent --|> MediaComponent
+
+VideoFrame --|> MediaFrame
+AudioFrame --|> MediaFrame
+SubtitleFrame --|> MediaFrame
+
+VideoBlock --|> MediaBlock
+AudioBlock --|> MediaBlock
+SubtitleBlock --|> MediaBlock
+
+MediaComponent ..> MediaFrame : creates
+MediaComponent ..> MediaBlock : materializes
+MediaContainer ..> MediaFrame : decodes
+
+@enduml
