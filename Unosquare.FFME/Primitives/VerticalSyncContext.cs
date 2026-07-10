@@ -18,6 +18,11 @@
     internal sealed class VerticalSyncContext : IDisposable
     {
         private static readonly object NativeSyncLock = new object();
+        private static readonly object PulseLock = new object();
+        private static Thread BroadcastThread;
+        private static int BroadcastWaiterCount;
+        private static long SharedRefreshPeriodTicks = TimeSpan.FromSeconds(1d / 60d).Ticks;
+
         private readonly Stopwatch RefreshStopwatch = Stopwatch.StartNew();
         private readonly object SyncLock = new object();
         private bool IsDisposed;
@@ -66,6 +71,12 @@
         /// Gets a value indicating whether Vertical Synchronization is available on the system.
         /// </summary>
         public static bool IsAvailable { get; private set; }
+
+        /// <summary>
+        /// Gets the refresh period of the primary display device as measured
+        /// by the shared vertical blank waiter thread.
+        /// </summary>
+        public static TimeSpan SharedRefreshPeriod => TimeSpan.FromTicks(Interlocked.Read(ref SharedRefreshPeriodTicks));
 
         /// <summary>
         /// Gets the display device refresh rate in Hz.
@@ -143,6 +154,40 @@
         public static void Flush() => NativeMethods.DwmFlush();
 
         /// <summary>
+        /// Waits for the next vertical blank of the primary display adapter using a single,
+        /// process-wide waiter thread that broadcasts the signal to all callers.
+        /// Unlike creating one <see cref="VerticalSyncContext"/> per caller, this guarantees
+        /// only one kernel-mode vertical blank wait and one adapter handle exist regardless
+        /// of how many media elements are rendering simultaneously. Issuing many concurrent
+        /// <see cref="NativeMethods.D3DKMTWaitForVerticalBlankEvent"/> calls is known to
+        /// destabilize desktop composition.
+        /// </summary>
+        /// <returns>True when a vertical blank signal was received; false when the wait timed out or v-sync is unavailable.</returns>
+        public static bool WaitForVerticalBlank()
+        {
+            if (!IsAvailable)
+            {
+                Thread.Sleep(Constants.DefaultTimingPeriod);
+                return false;
+            }
+
+            EnsureBroadcastThread();
+            Interlocked.Increment(ref BroadcastWaiterCount);
+
+            try
+            {
+                // Wait for the broadcast pulse with a timeout so callers never hang
+                // if the adapter stops signaling (e.g. display change or driver reset).
+                lock (PulseLock)
+                    return Monitor.Wait(PulseLock, TimeSpan.FromTicks(SharedRefreshPeriod.Ticks * 4));
+            }
+            finally
+            {
+                Interlocked.Decrement(ref BroadcastWaiterCount);
+            }
+        }
+
+        /// <summary>
         /// Waits for the vertical blanking interval on the primary display adapter to occur and then returns.
         /// </summary>
         /// <returns>True if the wait was performed using the adapter, and false otherwise.</returns>
@@ -195,6 +240,54 @@
                 IsDisposed = true;
 
                 ReleaseAdapter();
+            }
+        }
+
+        /// <summary>
+        /// Lazily starts the single background thread that waits for vertical blanks
+        /// and broadcasts them to callers of <see cref="WaitForVerticalBlank"/>.
+        /// </summary>
+        private static void EnsureBroadcastThread()
+        {
+            if (BroadcastThread != null)
+                return;
+
+            lock (NativeSyncLock)
+            {
+                if (BroadcastThread != null)
+                    return;
+
+                BroadcastThread = new Thread(BroadcastVerticalBlanks)
+                {
+                    IsBackground = true,
+                    Name = $"{nameof(VerticalSyncContext)}.Broadcast",
+                };
+
+                BroadcastThread.Start();
+            }
+        }
+
+        /// <summary>
+        /// Continuously waits for vertical blanks on a private context and pulses
+        /// all threads blocked on <see cref="WaitForVerticalBlank"/>.
+        /// </summary>
+        private static void BroadcastVerticalBlanks()
+        {
+            using var vsync = new VerticalSyncContext();
+            while (true)
+            {
+                // Do not hold adapter waits when nobody is listening.
+                if (Interlocked.CompareExchange(ref BroadcastWaiterCount, 0, 0) <= 0)
+                {
+                    Thread.Sleep(Constants.DefaultTimingPeriod);
+                    continue;
+                }
+
+                vsync.WaitForBlank();
+                Interlocked.Exchange(ref SharedRefreshPeriodTicks, vsync.RefreshPeriod.Ticks);
+
+                lock (PulseLock)
+                    Monitor.PulseAll(PulseLock);
             }
         }
 

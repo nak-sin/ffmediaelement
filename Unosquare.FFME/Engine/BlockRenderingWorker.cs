@@ -18,6 +18,14 @@ namespace Unosquare.FFME.Engine
     /// <seealso cref="IMediaWorker" />
     internal sealed class BlockRenderingWorker : WorkerBase, IMediaWorker, ILoggingSource
     {
+        /// <summary>
+        /// The minimum amount of time to give up the CPU on every quantum cycle.
+        /// Without a guaranteed wait, oversubscribed scenarios (i.e. more simultaneous
+        /// media elements than CPU cores) turn the quantum loop into a busy wait that
+        /// starves the rest of the system of CPU time.
+        /// </summary>
+        private static readonly TimeSpan MinimumQuantumWaitTime = TimeSpan.FromMilliseconds(1);
+
         private readonly AtomicBoolean HasInitialized = new(false);
         private readonly Action<MediaType[]> SerialRenderBlocks;
         private readonly Action<MediaType[]> ParallelRenderBlocks;
@@ -43,7 +51,7 @@ namespace Unosquare.FFME.Engine
             QuantumThread = new Thread(RunQuantumThread)
             {
                 IsBackground = true,
-                Priority = ThreadPriority.Highest,
+                Priority = ThreadPriority.AboveNormal,
                 Name = $"{nameof(BlockRenderingWorker)}.Thread",
             };
 
@@ -184,7 +192,6 @@ namespace Unosquare.FFME.Engine
         {
             try
             {
-                using var vsync = new VerticalSyncContext();
                 while (WorkerState != WorkerState.Stopped)
                 {
                     if (!VerticalSyncContext.IsAvailable)
@@ -197,21 +204,34 @@ namespace Unosquare.FFME.Engine
 
                     if (performVersticalSyncWait)
                     {
+                        // Vertical blank waits are performed via the single, process-wide
+                        // waiter so that any number of simultaneous media elements results
+                        // in exactly one kernel-mode vertical blank wait and adapter handle.
+                        var refreshPeriodTicks = VerticalSyncContext.SharedRefreshPeriod.Ticks;
+                        var performedVerticalSyncWait = false;
+
                         // wait a few times as there is no need to move on to the next frame
                         // if the remaining cycle time is more than twice the refresh rate.
-                        while (!IsDisposed && !IsDisposing && RemainingCycleTime.Ticks >= vsync.RefreshPeriod.Ticks * 2)
-                            vsync.WaitForBlank();
+                        while (!IsDisposed && !IsDisposing && RemainingCycleTime.Ticks >= refreshPeriodTicks * 2)
+                            performedVerticalSyncWait |= VerticalSyncContext.WaitForVerticalBlank();
 
                         // wait one last time for the actual v-sync
                         if (!IsDisposed && !IsDisposing && RemainingCycleTime.Ticks > 0)
-                            vsync.WaitForBlank();
+                            performedVerticalSyncWait |= VerticalSyncContext.WaitForVerticalBlank();
+
+                        // If no v-sync wait took place (i.e. the cycle is already running late),
+                        // still give up the CPU for a minimal amount of time so this loop
+                        // does not become a busy wait.
+                        if (!performedVerticalSyncWait && !IsDisposed && !IsDisposing)
+                            QuantumWaiter.Wait(MinimumQuantumWaitTime);
                     }
                     else
                     {
-                        // Perform a synthetic wait
+                        // Perform a synthetic wait, always yielding the CPU for at least
+                        // a minimal amount of time even when the cycle is running late.
                         var waitTime = RemainingCycleTime;
-                        if (!IsDisposed && !IsDisposing && waitTime.Ticks > 0)
-                            QuantumWaiter.Wait(waitTime);
+                        if (!IsDisposed && !IsDisposing)
+                            QuantumWaiter.Wait(waitTime > MinimumQuantumWaitTime ? waitTime : MinimumQuantumWaitTime);
                     }
 
                     if (!TryBeginCycle())
